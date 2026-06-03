@@ -323,10 +323,24 @@ def handle_form_questions(page, job_title, location):
 
     for item in question_items:
         try:
-            label_el = item.query_selector('label, legend, span.t-bold')
-            if not label_el:
-                continue
-            question = label_el.inner_text().strip()
+            # Try multiple label selectors; fall back to aria-label on the input
+            label_el = item.query_selector(
+                'label, legend, span.t-bold, span[class*="t-bold"], '
+                '[data-test-form-builder-id] > span'
+            )
+            if label_el:
+                question = label_el.inner_text().strip()
+            else:
+                any_input = item.query_selector(
+                    'input, select, textarea, [role="combobox"]'
+                )
+                question = (
+                    (any_input.get_attribute('aria-label') or '').strip()
+                    if any_input else ''
+                )
+
+            # Strip required markers so the AI sees a clean question
+            question = question.replace('*', '').replace('(required)', '').strip()
             if not question:
                 continue
 
@@ -377,8 +391,7 @@ def handle_form_questions(page, job_title, location):
                 continue
 
             # --- LinkedIn custom dropdown (combobox / artdeco-dropdown / listbox) ---
-            # These are NOT standard <select>; they use role="combobox" or a trigger
-            # button that opens a role="listbox" elsewhere in the DOM.
+            # Three escalating attempts; options are rendered outside item in the DOM.
             custom_trigger = item.query_selector(
                 '[role="combobox"], '
                 'input[aria-autocomplete], '
@@ -386,6 +399,9 @@ def handle_form_questions(page, job_title, location):
                 'button.artdeco-dropdown__trigger'
             )
             if custom_trigger:
+                handled = False
+
+                # Attempt 1: click trigger → wait for options → click best match
                 try:
                     custom_trigger.click()
                     time.sleep(1)
@@ -402,14 +418,90 @@ def handle_form_questions(page, job_title, location):
                             location=location,
                         )
                         _click_best_option(options, answer)
-                        print(f"    A (custom dropdown): {answer[:60]}")
+                        print(f"    A (dropdown-click): {answer[:60]}")
                         time.sleep(0.5)
-                    else:
-                        # No options loaded — close the dropdown and move on
-                        page.keyboard.press('Escape')
-                        time.sleep(0.3)
-                except Exception:
-                    pass
+                        handled = True
+                except Exception as e:
+                    print(f"    dropdown-click failed: {e}")
+
+                # Attempt 2: type partial answer to trigger autocomplete, then click
+                if not handled:
+                    combobox_input = item.query_selector(
+                        '[role="combobox"], input[aria-autocomplete]'
+                    )
+                    if combobox_input:
+                        try:
+                            answer = get_answer(
+                                question, job_title=job_title, location=location
+                            )
+                            combobox_input.click()
+                            time.sleep(0.4)
+                            combobox_input.fill('')
+                            combobox_input.type(answer[:15], delay=80)
+                            time.sleep(1)
+                            try:
+                                page.wait_for_selector('[role="option"]', timeout=3000)
+                            except PlaywrightTimeoutError:
+                                pass
+                            options = _collect_listbox_options(page)
+                            if options:
+                                _click_best_option(options, answer)
+                                print(f"    A (dropdown-type): {answer[:60]}")
+                                time.sleep(0.5)
+                                handled = True
+                        except Exception as e:
+                            print(f"    dropdown-type failed: {e}")
+
+                # Attempt 3: JS native value setter (React-compatible) + hidden select
+                if not handled:
+                    try:
+                        answer = get_answer(
+                            question, job_title=job_title, location=location
+                        )
+                        result_js = item.evaluate(
+                            """(el, ans) => {
+                                // Combobox: use React-compatible native setter
+                                const cb = el.querySelector('[role="combobox"], input[aria-autocomplete]');
+                                if (cb) {
+                                    const setter = Object.getOwnPropertyDescriptor(
+                                        HTMLInputElement.prototype, 'value').set;
+                                    setter.call(cb, ans);
+                                    ['input','change'].forEach(ev =>
+                                        cb.dispatchEvent(new Event(ev, {bubbles:true})));
+                                    return 'combobox-js';
+                                }
+                                // Hidden <select> backing the custom component
+                                const sel = el.querySelector('select');
+                                if (sel) {
+                                    const ansL = ans.toLowerCase();
+                                    for (const opt of sel.options) {
+                                        if (opt.text.toLowerCase().includes(ansL.slice(0,8))) {
+                                            sel.value = opt.value;
+                                            sel.dispatchEvent(new Event('change', {bubbles:true}));
+                                            return 'hidden-select';
+                                        }
+                                    }
+                                    if (sel.options.length > 1) {
+                                        sel.value = sel.options[1].value;
+                                        sel.dispatchEvent(new Event('change', {bubbles:true}));
+                                        return 'hidden-select-fallback';
+                                    }
+                                }
+                                return null;
+                            }""",
+                            answer,
+                        )
+                        if result_js:
+                            print(f"    A (JS/{result_js}): {answer[:60]}")
+                            handled = True
+                    except Exception as e:
+                        print(f"    JS attempt failed: {e}")
+
+                if not handled:
+                    page.keyboard.press('Escape')
+                    time.sleep(0.3)
+                    print(f"    ⚠️  Could not fill dropdown: {question[:70]}")
+
                 continue
 
             # --- radio buttons ---
@@ -461,6 +553,78 @@ def handle_form_questions(page, job_title, location):
 
         except Exception:
             continue
+
+
+# ---------------------------------------------------------------------------
+# Validation error inspector
+# ---------------------------------------------------------------------------
+
+def check_and_print_errors(page):
+    """
+    Scan the current form step for validation errors and unanswered required fields.
+    Prints a detailed report so we can see exactly what the bot is missing.
+    Returns a list of error strings (empty list = clean).
+    """
+    errors = []
+
+    # Explicit error messages LinkedIn renders
+    for sel in [
+        '.artdeco-inline-feedback--error',
+        '[data-test-form-element-error-message]',
+        '[class*="error-message"]',
+        '[class*="inline-feedback"]',
+    ]:
+        try:
+            for el in page.query_selector_all(sel):
+                if el.is_visible():
+                    text = el.inner_text().strip()
+                    if text:
+                        errors.append(f"error: {text}")
+        except Exception:
+            continue
+
+    # Fields marked aria-invalid="true"
+    try:
+        for field in page.query_selector_all('[aria-invalid="true"]'):
+            fid = field.get_attribute('id')
+            lbl = page.query_selector(f'label[for="{fid}"]') if fid else None
+            label_text = lbl.inner_text().strip() if lbl else field.get_attribute('aria-label') or 'unknown'
+            errors.append(f"invalid field: {label_text}")
+    except Exception:
+        pass
+
+    # Required fields that are still empty
+    try:
+        for field in page.query_selector_all(
+            'input[required], select[required], textarea[required], '
+            '[aria-required="true"]'
+        ):
+            if not field.is_visible():
+                continue
+            val = ''
+            try:
+                val = field.input_value()
+            except Exception:
+                pass
+            if not val:
+                fid = field.get_attribute('id')
+                lbl = page.query_selector(f'label[for="{fid}"]') if fid else None
+                label_text = (
+                    lbl.inner_text().strip() if lbl
+                    else field.get_attribute('aria-label') or field.get_attribute('name') or 'unnamed'
+                )
+                errors.append(f"empty required: {label_text}")
+    except Exception:
+        pass
+
+    if errors:
+        print(f"  ⚠️  Form issues ({len(errors)}):")
+        for e in errors:
+            print(f"      • {e}")
+    else:
+        print("  ✓  No validation errors detected")
+
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +786,7 @@ def apply_to_jobs_on_search_page(page, job_title, max_to_apply, applied_jobs):
                 time.sleep(1.5)
 
                 handle_form_questions(page, title, location)
+                check_and_print_errors(page)
                 time.sleep(0.5)
 
                 result = click_progression_button(page)
