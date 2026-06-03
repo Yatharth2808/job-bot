@@ -1,11 +1,33 @@
 import os
 import re
-from groq import Groq
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# ---------------------------------------------------------------------------
+# Clients — Ollama (primary, local, no rate limits) + Groq (fallback)
+# ---------------------------------------------------------------------------
+
+try:
+    import ollama as _ollama
+    import urllib.request as _ur
+    OLLAMA_MODEL = "llama3"
+    # Check service is reachable without loading the model (avoids slow first-run timeout)
+    _ur.urlopen("http://localhost:11434/api/tags", timeout=3).read()
+    OLLAMA_AVAILABLE = True
+    print("✓ Ollama (llama3) is available — using local AI, no rate limits")
+except Exception:
+    OLLAMA_AVAILABLE = False
+    print("⚠ Ollama not available — falling back to Groq")
+
+try:
+    from groq import Groq
+    _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    GROQ_AVAILABLE = True
+except Exception:
+    GROQ_AVAILABLE = False
+
 
 PROFILE = {
     "full_name": os.getenv("FULL_NAME"),
@@ -51,6 +73,49 @@ PROFILE = {
     "ethnicity": os.getenv("ETHNICITY"),
 }
 
+
+# ---------------------------------------------------------------------------
+# Internal LLM call — Ollama first, Groq fallback
+# ---------------------------------------------------------------------------
+
+def _call_llm(prompt, max_tokens=50):
+    """Call Ollama (local) first; fall back to Groq on any failure."""
+    if OLLAMA_AVAILABLE:
+        try:
+            resp = _ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                options={"num_predict": max_tokens, "temperature": 0.1},
+            )
+            return resp["message"]["content"].strip()
+        except Exception as e:
+            print(f"    Ollama error: {e} — trying Groq fallback")
+
+    if GROQ_AVAILABLE:
+        for attempt in range(3):
+            try:
+                resp = _groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                )
+                return resp.choices[0].message.content.strip()
+            except Exception as e:
+                if "429" in str(e) and attempt < 2:
+                    wait = 8 * (attempt + 1)
+                    print(f"    Groq rate limit — waiting {wait}s (attempt {attempt+1}/3)…")
+                    time.sleep(wait)
+                    continue
+                print(f"    Groq error: {e}")
+                break
+
+    return None  # both failed
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def get_smart_salary(job_title, location):
     prompt = f"""
 What is the average entry level salary in USD for:
@@ -72,99 +137,77 @@ Rules:
 
 Return ONLY one number. Nothing else.
 """
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=20
-    )
+    result = _call_llm(prompt, max_tokens=20)
+    if result:
+        numbers = re.findall(r'\d+', result.replace(',', ''))
+        for num in numbers:
+            if 40000 <= int(num) <= 200000:
+                return num
+    return "70000"
 
-    salary = response.choices[0].message.content.strip()
-    numbers = re.findall(r'\d+', salary.replace(',', ''))
-    for num in numbers:
-        if 40000 <= int(num) <= 200000:
-            return num
-    return "75000"
 
 def get_answer(question, options=None, job_title=None, location=None):
     q_lower = question.lower()
 
-    # Hard overrides — never let the AI answer these incorrectly
-    # Sponsorship: I-485 Pending does NOT mean sponsorship is required
+    # --- Hard overrides (never let the AI get these wrong) ---
+
+    # Sponsorship: I-485 Pending = work authorized, NO sponsorship needed
     if any(k in q_lower for k in ('sponsor', 'visa sponsor', 'h-1b', 'h1b', 'require visa')):
-        answer = 'No'
         if options:
             for opt in options:
                 if 'no' in opt.lower():
                     return opt
-        return answer
+        return 'No'
 
-    # Work authorization: always authorized
+    # Work authorization: always Yes
     if any(k in q_lower for k in ('authorized to work', 'legally authorized', 'eligible to work')):
-        answer = 'Yes'
         if options:
             for opt in options:
                 if 'yes' in opt.lower():
                     return opt
-        return answer
+        return 'Yes'
 
-    # Handle salary questions smartly
-    salary_keywords = ['salary', 'compensation', 'pay', 'wage', 'expected salary', 'desired salary']
-    if any(keyword in q_lower for keyword in salary_keywords):
+    # Salary
+    if any(k in q_lower for k in ('salary', 'compensation', 'pay', 'wage', 'expected salary', 'desired salary')):
         if job_title and location:
             salary = get_smart_salary(job_title, location)
-            print(f"Smart salary for {job_title} in {location}: ${salary}")
+            print(f"    Smart salary for {job_title} in {location}: ${salary}")
             return salary
 
-    options_text = ""
-    if options:
-        options_text = f"\nAvailable options to choose from:\n{chr(10).join(options)}"
+    # --- AI answer ---
+    options_text = (
+        f"\nAvailable options (pick EXACTLY one as written):\n" + "\n".join(options)
+        if options else ""
+    )
 
-    prompt = f"""
-You are filling out a job application for Yatharth Gautam.
-Here is his complete profile:
+    prompt = f"""You are filling out a job application for Yatharth Gautam.
+His profile: {PROFILE}
 
-{PROFILE}
-
-The application is asking this question:
-"{question}"
-{options_text}
+Question: "{question}"{options_text}
 
 Rules:
-1. Answer HONESTLY based on his profile
-2. Keep answer SHORT - one word or one sentence max
-3. If it's a Yes/No question → answer Yes or No only
-4. If options are provided → pick the BEST matching option exactly as written
-5. Work authorization → ALWAYS "Yes" — he is authorized to work in the US
-6. Visa sponsorship → ALWAYS "No" — he does NOT require sponsorship (I-485 Pending = work authorized, no sponsorship needed)
-7. For location questions about specific cities he's not in → answer No but willing to relocate
-8. For technology experience → use his years from profile
-9. Never make up experience he doesn't have
+1. Answer based on his profile — be honest
+2. ONE word or ONE short phrase only — no explanation
+3. Yes/No questions → only "Yes" or "No"
+4. If options given → return the BEST option EXACTLY as written
+5. Work authorization → always "Yes"
+6. Visa sponsorship → always "No" (I-485 Pending = authorized, no sponsorship needed)
+7. Location questions about cities he's not in → "No"
+8. Tech years → use his profile values
 
-Return ONLY the answer, nothing else. No explanation.
-"""
+Return ONLY the answer."""
 
-    for attempt in range(3):
-        try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=50
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            if '429' in str(e) and attempt < 2:
-                wait = 8 * (attempt + 1)
-                print(f"    Groq rate limit — waiting {wait}s (attempt {attempt+1}/3)…")
-                import time as _t; _t.sleep(wait)
-                continue
-            print(f"    Groq error: {e}")
-            # Fallback: Yes for positive questions, No for negative ones
-            q_l = question.lower()
-            if options:
-                return options[0]
-            if any(w in q_l for w in ('sponsor', 'require visa', 'criminal')):
-                return 'No'
-            return 'Yes'
+    result = _call_llm(prompt, max_tokens=50)
+    if result:
+        return result
+
+    # Both LLMs failed — safe static fallback
+    if options:
+        return options[0]
+    if any(w in q_lower for w in ('sponsor', 'criminal', 'felony')):
+        return 'No'
+    return 'Yes'
+
 
 def answer_dropdown(question_text, options, job_title=None, location=None):
     answer = get_answer(question_text, options, job_title, location)
@@ -181,9 +224,9 @@ def answer_text(question_text, job_title=None, location=None):
     print(f"Q: {question_text[:60]}... → A: {answer}")
     return answer
 
+
 if __name__ == "__main__":
     print("Testing question handler...\n")
-
     print("=== Basic Questions ===")
     print(get_answer("Are you authorized to work in the United States?", ["Yes", "No"]))
     print(get_answer("Do you require visa sponsorship?", ["Yes", "No"]))
@@ -193,7 +236,5 @@ if __name__ == "__main__":
 
     print("\n=== Smart Salary Tests ===")
     print(f"SF Software Engineer: ${get_smart_salary('Software Engineer', 'San Francisco')}")
-    print(f"NYC Data Analyst: ${get_smart_salary('Data Analyst', 'New York')}")
     print(f"Texas Python Developer: ${get_smart_salary('Python Developer', 'Texas')}")
     print(f"Remote ML Engineer: ${get_smart_salary('ML Engineer', 'Remote')}")
-    print(f"Seattle Data Scientist: ${get_smart_salary('Data Scientist', 'Seattle')}")
