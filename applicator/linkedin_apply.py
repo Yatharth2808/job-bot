@@ -1210,13 +1210,20 @@ def run_apply(job_titles, max_applications=DAILY_LIMIT):
             if total_applied >= max_to_apply:
                 break
 
-            count = apply_to_jobs_on_search_page(
-                page,
-                job_title,
-                max_to_apply - total_applied,
-                applied_jobs,
-            )
-            total_applied += count
+            try:
+                count = apply_to_jobs_on_search_page(
+                    page,
+                    job_title,
+                    max_to_apply - total_applied,
+                    applied_jobs,
+                )
+                total_applied += count
+            except Exception as e:
+                if 'closed' in str(e).lower() or 'target' in str(e).lower():
+                    print(f"\n⚠️  Browser was closed — stopping gracefully.")
+                    break
+                print(f"Error on '{job_title}': {e}")
+                continue
             time.sleep(3)
 
         browser.close()

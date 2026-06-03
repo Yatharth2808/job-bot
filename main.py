@@ -1,11 +1,16 @@
 from applicator.linkedin_apply import run_apply
 
 JOB_TITLES = [
+    "Entry Level Software Engineer",
     "Entry Level Software Developer",
     "Entry Level Data Analyst",
-    "Junior Python Developer",
+    "Junior Data Analyst",
     "Entry Level AI Engineer",
-    "Data Science Analyst",
+    "Entry Level Machine Learning Engineer",
+    "Junior Python Developer",
+    "Junior Data Scientist",
+    "Entry Level Backend Developer",
+    "Entry Level Full Stack Developer",
 ]
 
 if __name__ == "__main__":
