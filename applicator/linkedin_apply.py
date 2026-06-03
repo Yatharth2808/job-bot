@@ -498,9 +498,35 @@ def handle_form_questions(page, job_title, location):
                         print(f"    JS attempt failed: {e}")
 
                 if not handled:
-                    page.keyboard.press('Escape')
-                    time.sleep(0.3)
-                    print(f"    ⚠️  Could not fill dropdown: {question[:70]}")
+                    # Last resort: force-click the first visible option via JS
+                    forced = page.evaluate("""
+                        () => {
+                            const opts = document.querySelectorAll('[role="option"]');
+                            for (const o of opts) {
+                                if (o.offsetParent !== null) { o.click(); return 'option'; }
+                            }
+                            return null;
+                        }
+                    """)
+                    if not forced:
+                        # No open listbox — try to JS-select first option of a hidden select
+                        forced = item.evaluate("""
+                            (el) => {
+                                const sel = el.querySelector('select');
+                                if (sel && sel.options.length > 1) {
+                                    sel.value = sel.options[1].value;
+                                    sel.dispatchEvent(new Event('change', {bubbles:true}));
+                                    return 'select';
+                                }
+                                return null;
+                            }
+                        """)
+                    if forced:
+                        print(f"    A (forced-first/{forced}): {question[:60]}")
+                    else:
+                        page.keyboard.press('Escape')
+                        time.sleep(0.3)
+                        print(f"    ⚠️  Dropdown unfillable (continuing anyway): {question[:60]}")
 
                 continue
 
@@ -553,6 +579,52 @@ def handle_form_questions(page, job_title, location):
 
         except Exception:
             continue
+
+    # --- Required-field safety net ---
+    # Second pass: any required input still empty after the main loop gets a
+    # safe generic answer so validation cannot block the Next/Submit button.
+    try:
+        for field in page.query_selector_all(
+            'input[required], select[required], textarea[required], '
+            '[aria-required="true"]'
+        ):
+            if not field.is_visible():
+                continue
+            try:
+                val = field.input_value()
+            except Exception:
+                continue
+            if val:
+                continue
+
+            tag = field.evaluate("el => el.tagName.toLowerCase()")
+            field_type = (field.get_attribute('type') or 'text').lower()
+            fid = field.get_attribute('id') or ''
+            lbl = page.query_selector(f'label[for="{fid}"]') if fid else None
+            label_text = (
+                lbl.inner_text().strip() if lbl
+                else field.get_attribute('aria-label') or 'field'
+            ).replace('*', '').strip()
+
+            if tag == 'select':
+                try:
+                    field.select_option(index=1)
+                    print(f"    ⚡ safety-net select: {label_text[:50]}")
+                except Exception:
+                    pass
+            elif field_type == 'number':
+                field.fill('1')
+                print(f"    ⚡ safety-net number=1: {label_text[:50]}")
+            else:
+                answer = get_answer(label_text, job_title=job_title, location=location)
+                try:
+                    field.fill(str(answer))
+                    print(f"    ⚡ safety-net text: {label_text[:50]} = {str(answer)[:40]}")
+                except Exception:
+                    pass
+            time.sleep(0.2)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +697,33 @@ def check_and_print_errors(page):
         print("  ✓  No validation errors detected")
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Blocker detection (CAPTCHA / mandatory file upload)
+# ---------------------------------------------------------------------------
+
+def has_blocker(page):
+    """Return True only if there is a CAPTCHA or a required file-upload field."""
+    for sel in [
+        'iframe[src*="recaptcha"]', 'iframe[src*="captcha"]',
+        '[class*="captcha"]', '#recaptcha',
+    ]:
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                print("  🚫 CAPTCHA detected")
+                return True
+        except Exception:
+            continue
+    try:
+        for finput in page.query_selector_all('input[type="file"][required]'):
+            if finput.is_visible():
+                print("  🚫 Required file upload (cannot handle)")
+                return True
+    except Exception:
+        pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -838,8 +937,12 @@ def apply_to_jobs_on_search_page(page, job_title, max_to_apply, applied_jobs):
                         continue
 
                 elif result == 'none':
-                    print("  No navigation button found — aborting")
-                    break
+                    if has_blocker(page):
+                        print("  Aborting: unresolvable blocker (CAPTCHA / file upload)")
+                        break
+                    # No button yet but no hard blocker — wait and retry this step
+                    print("  No button found — waiting and retrying…")
+                    time.sleep(2)
 
                 # result == 'next': just continue to the next step
 
