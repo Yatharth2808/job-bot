@@ -121,14 +121,28 @@ Rules:
 Return ONLY the answer, nothing else. No explanation.
 """
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=50
-    )
-
-    answer = response.choices[0].message.content.strip()
-    return answer
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            if '429' in str(e) and attempt < 2:
+                wait = 8 * (attempt + 1)
+                print(f"    Groq rate limit — waiting {wait}s (attempt {attempt+1}/3)…")
+                import time as _t; _t.sleep(wait)
+                continue
+            print(f"    Groq error: {e}")
+            # Fallback: Yes for positive questions, No for negative ones
+            q_l = question.lower()
+            if options:
+                return options[0]
+            if any(w in q_l for w in ('sponsor', 'require visa', 'criminal')):
+                return 'No'
+            return 'Yes'
 
 def answer_dropdown(question_text, options, job_title=None, location=None):
     answer = get_answer(question_text, options, job_title, location)

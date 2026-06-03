@@ -347,30 +347,165 @@ def handle_form_questions(page, job_title, location):
             print(f"    Q: {question[:80]}")
 
             # --- known-field fast-path (no AI call needed) ---
-            # Fill standard contact fields directly from the profile to avoid
-            # burning Groq rate-limit tokens on fields that never need AI.
             q_lower = question.lower()
             _full_name = os.getenv("FULL_NAME", "")
             _name_parts = _full_name.split()
-            _profile_map = {
-                'first name':    _name_parts[0] if _name_parts else '',
-                'last name':     _name_parts[-1] if len(_name_parts) > 1 else '',
-                'email':         os.getenv("EMAIL", ""),
-                'phone':         os.getenv("PHONE", ""),
-                'mobile':        os.getenv("PHONE", ""),
+
+            # 1. Contact / personal text fields
+            _text_map = {
+                'first name':  _name_parts[0] if _name_parts else '',
+                'last name':   _name_parts[-1] if len(_name_parts) > 1 else '',
+                'email':       os.getenv("EMAIL", ""),
+                'phone':       os.getenv("PHONE", ""),
+                'mobile':      os.getenv("PHONE", ""),
+                'linkedin':    os.getenv("LINKEDIN_URL", ""),
+                'github':      os.getenv("GITHUB_URL", ""),
+                'portfolio':   os.getenv("PORTFOLIO_URL", ""),
+                'website':     os.getenv("PORTFOLIO_URL", ""),
+                'gpa':         os.getenv("GPA", ""),
+                'salary':      os.getenv("SALARY_EXPECTATION", "70000"),
             }
-            for keyword, value in _profile_map.items():
+            _handled = False
+            for keyword, value in _text_map.items():
                 if keyword in q_lower and value:
                     inp = item.query_selector('input, textarea')
                     if inp:
                         try:
                             if not inp.input_value():
                                 inp.fill(value)
-                                print(f"    A (profile): {value[:60]}")
+                                print(f"    A (profile/{keyword}): {value[:60]}")
                                 time.sleep(0.2)
                         except Exception:
                             pass
-                    break  # handled
+                    _handled = True
+                    break
+
+            # 2. Work history text fields
+            if not _handled:
+                _work_map = {
+                    'your title':   os.getenv("CURRENT_TITLE", ""),
+                    'job title':    os.getenv("CURRENT_TITLE", ""),
+                    'company':      os.getenv("CURRENT_EMPLOYER", ""),
+                    'employer':     os.getenv("CURRENT_EMPLOYER", ""),
+                    'description':  os.getenv("WORK_DESCRIPTION", ""),
+                }
+                for keyword, value in _work_map.items():
+                    if keyword in q_lower and value:
+                        inp = item.query_selector('input, textarea')
+                        if inp:
+                            try:
+                                if not inp.input_value():
+                                    inp.fill(value)
+                                    print(f"    A (work/{keyword}): {value[:60]}")
+                                    time.sleep(0.2)
+                            except Exception:
+                                pass
+                        _handled = True
+                        break
+
+            # 3. Yes/No work-auth questions — answer directly from profile, no AI
+            if not _handled:
+                _yn_map = [
+                    (['authorized to work', 'authorized to be employed', 'legally authorized'],  os.getenv("AUTHORIZED_TO_WORK", "Yes")),
+                    (['sponsorship', 'visa sponsor', 'require sponsor'],                          os.getenv("REQUIRE_SPONSORSHIP", "No")),
+                    (['commut', 'comfortable travel', 'willing to travel'],                       'Yes'),
+                    (['relocat'],                                                                  os.getenv("WILLING_TO_RELOCATE", "Yes")),
+                    (['remote', 'work from home', 'work remotely'],                               'Yes'),
+                    (['hybrid'],                                                                   os.getenv("HYBRID_AVAILABLE", "Yes")),
+                    (['onsite', 'on-site', 'in office', 'in-office'],                             os.getenv("ONSITE_AVAILABLE", "Yes")),
+                    (['veteran'],                                                                  os.getenv("VETERAN_STATUS", "No").strip()),
+                    (['disability', 'disabled'],                                                   os.getenv("DISABILITY_STATUS", "No").strip()),
+                    (['background check', 'drug test', 'drug screen'],                            'Yes'),
+                    (['18 years', 'at least 18', 'over 18'],                                      'Yes'),
+                ]
+                for keywords, yn_answer in _yn_map:
+                    if any(kw in q_lower for kw in keywords):
+                        # Try radio first
+                        radios = item.query_selector_all('input[type="radio"]')
+                        if radios:
+                            for r in radios:
+                                rid = r.get_attribute('id')
+                                lbl = page.query_selector(f'label[for="{rid}"]') if rid else None
+                                if lbl and yn_answer.lower() in lbl.inner_text().lower():
+                                    r.evaluate("el => el.click()")
+                                    print(f"    A (yn-radio/{yn_answer}): {question[:50]}")
+                                    time.sleep(0.2)
+                                    _handled = True
+                                    break
+                            if not _handled and radios:
+                                # fallback: click Yes (first) or No based on answer
+                                idx = 0 if yn_answer.lower() == 'yes' else 1
+                                radios[min(idx, len(radios)-1)].evaluate("el => el.click()")
+                                print(f"    A (yn-radio-fallback/{yn_answer}): {question[:50]}")
+                                _handled = True
+                        if not _handled:
+                            # Try select
+                            sel = item.query_selector('select')
+                            if sel:
+                                try:
+                                    sel.select_option(label=yn_answer)
+                                    print(f"    A (yn-select/{yn_answer}): {question[:50]}")
+                                    _handled = True
+                                except Exception:
+                                    try:
+                                        sel.select_option(index=1)
+                                        _handled = True
+                                    except Exception:
+                                        pass
+                        if _handled:
+                            break
+
+            # 4. "Years of experience with X" — map to env vars, no AI needed
+            if not _handled and 'year' in q_lower and ('experience' in q_lower or 'work' in q_lower):
+                _tech_map = {
+                    'python':           os.getenv("YEARS_PYTHON", "3"),
+                    'java ':            os.getenv("YEARS_JAVA", "4"),
+                    'javascript':       os.getenv("YEARS_JAVASCRIPT", "2"),
+                    'react':            os.getenv("YEARS_REACT", "1"),
+                    'sql':              os.getenv("YEARS_SQL", "2"),
+                    'firebase':         os.getenv("YEARS_FIREBASE", "2"),
+                    'data analysis':    os.getenv("YEARS_DATA_ANALYSIS", "1"),
+                    'machine learning': os.getenv("YEARS_MACHINE_LEARNING", "1"),
+                    'docker':           os.getenv("YEARS_DOCKER", "1"),
+                    'git':              os.getenv("YEARS_GIT", "4"),
+                    'css':              os.getenv("YEARS_CSS", "2"),
+                    'html':             os.getenv("YEARS_HTML", "2"),
+                    'c++':              os.getenv("YEARS_CPP", "2"),
+                    'database':         os.getenv("YEARS_SQL", "2"),
+                    'open-source':      '1',
+                    'open source':      '1',
+                    'software':         os.getenv("YEARS_PROFESSIONAL", "0"),
+                    'construction':     '0',
+                    'commissioning':    '0',
+                    'manufacturing':    '0',
+                    'aerospace':        '0',
+                }
+                for tech, years in _tech_map.items():
+                    if tech in q_lower:
+                        inp = item.query_selector('input[type="number"], input[type="text"]')
+                        if inp:
+                            try:
+                                if not inp.input_value():
+                                    inp.fill(years)
+                                    print(f"    A (years/{tech}): {years}")
+                                    time.sleep(0.2)
+                                    _handled = True
+                            except Exception:
+                                pass
+                        if _handled:
+                            break
+                if not _handled:
+                    # Generic "years of experience" with unknown tech → answer 0
+                    inp = item.query_selector('input[type="number"], input[type="text"]')
+                    if inp:
+                        try:
+                            if not inp.input_value():
+                                inp.fill('0')
+                                print(f"    A (years/generic=0): {question[:50]}")
+                                time.sleep(0.2)
+                                _handled = True
+                        except Exception:
+                            pass
 
             # Location / city — combobox typeahead: type city then pick first suggestion
             if any(k in q_lower for k in ('city', 'location', 'address')):
@@ -953,14 +1088,27 @@ def apply_to_jobs_on_search_page(page, job_title, max_to_apply, applied_jobs):
 
             # --- multi-step form loop ---
             applied = False
+            last_error_sig = None
+            stuck_count = 0
 
             for step in range(MAX_FORM_STEPS):
                 print(f"  Step {step + 1}…")
                 time.sleep(1.5)
 
                 handle_form_questions(page, title, location)
-                check_and_print_errors(page)
+                errors = check_and_print_errors(page)
                 time.sleep(0.5)
+
+                # Detect stuck loop: same errors 3 steps in a row → give up on this job
+                err_sig = tuple(sorted(errors))
+                if err_sig and err_sig == last_error_sig:
+                    stuck_count += 1
+                    if stuck_count >= 3:
+                        print(f"  Stuck on same errors for {stuck_count} steps — discarding")
+                        break
+                else:
+                    stuck_count = 0
+                last_error_sig = err_sig
 
                 result = click_progression_button(page)
                 print(f"  → {result}")
