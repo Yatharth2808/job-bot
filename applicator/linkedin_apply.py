@@ -264,12 +264,62 @@ def wait_for_modal_gone(page, timeout_ms=5000):
 
 
 # ---------------------------------------------------------------------------
+# Custom dropdown helpers
+# ---------------------------------------------------------------------------
+
+def _collect_listbox_options(page):
+    """Return all currently visible (role=option) elements from anywhere on the page."""
+    for selector in [
+        '[role="option"]',
+        '[role="listbox"] li',
+        '.basic-typeahead__triggered-content [data-view-name]',
+        '.artdeco-dropdown__content li',
+        '.artdeco-dropdown__content [role="option"]',
+    ]:
+        els = page.query_selector_all(selector)
+        options = []
+        for el in els:
+            try:
+                if el.is_visible():
+                    text = el.inner_text().strip()
+                    if text and text.lower() not in ('', 'select an option', 'please select'):
+                        options.append((text, el))
+            except Exception:
+                continue
+        if options:
+            return options
+    return []
+
+
+def _click_best_option(options, answer):
+    """Click the option whose text best matches answer; fall back to the first option."""
+    answer_lower = answer.lower()
+    for opt_text, opt_el in options:
+        if answer_lower in opt_text.lower() or opt_text.lower() in answer_lower:
+            try:
+                opt_el.click()
+                return True
+            except Exception:
+                continue
+    try:
+        options[0][1].click()
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Form question handler
 # ---------------------------------------------------------------------------
 
 def handle_form_questions(page, job_title, location):
     """Fill every visible form element on the current Easy Apply step using AI."""
-    question_items = page.query_selector_all('.jobs-easy-apply-form-element')
+    # Catch both the classic class and LinkedIn's newer component class names
+    question_items = page.query_selector_all(
+        '.jobs-easy-apply-form-element, '
+        '[class*="fb-dash-form-element"], '
+        '[class*="text-entity-list-form-component"]'
+    )
 
     for item in question_items:
         try:
@@ -324,6 +374,42 @@ def handle_form_questions(page, job_title, location):
                             pass
                     print(f"    A: {answer[:60]}")
                     time.sleep(0.3)
+                continue
+
+            # --- LinkedIn custom dropdown (combobox / artdeco-dropdown / listbox) ---
+            # These are NOT standard <select>; they use role="combobox" or a trigger
+            # button that opens a role="listbox" elsewhere in the DOM.
+            custom_trigger = item.query_selector(
+                '[role="combobox"], '
+                'input[aria-autocomplete], '
+                'button[aria-haspopup="listbox"], '
+                'button.artdeco-dropdown__trigger'
+            )
+            if custom_trigger:
+                try:
+                    custom_trigger.click()
+                    time.sleep(1)
+                    try:
+                        page.wait_for_selector('[role="option"]', timeout=3000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    options = _collect_listbox_options(page)
+                    if options:
+                        answer = get_answer(
+                            question,
+                            options=[t for t, _ in options],
+                            job_title=job_title,
+                            location=location,
+                        )
+                        _click_best_option(options, answer)
+                        print(f"    A (custom dropdown): {answer[:60]}")
+                        time.sleep(0.5)
+                    else:
+                        # No options loaded — close the dropdown and move on
+                        page.keyboard.press('Escape')
+                        time.sleep(0.3)
+                except Exception:
+                    pass
                 continue
 
             # --- radio buttons ---
