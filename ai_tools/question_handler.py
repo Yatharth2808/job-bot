@@ -86,9 +86,30 @@ Return ONLY one number. Nothing else.
     return "75000"
 
 def get_answer(question, options=None, job_title=None, location=None):
+    q_lower = question.lower()
+
+    # Hard overrides — never let the AI answer these incorrectly
+    # Sponsorship: I-485 Pending does NOT mean sponsorship is required
+    if any(k in q_lower for k in ('sponsor', 'visa sponsor', 'h-1b', 'h1b', 'require visa')):
+        answer = 'No'
+        if options:
+            for opt in options:
+                if 'no' in opt.lower():
+                    return opt
+        return answer
+
+    # Work authorization: always authorized
+    if any(k in q_lower for k in ('authorized to work', 'legally authorized', 'eligible to work')):
+        answer = 'Yes'
+        if options:
+            for opt in options:
+                if 'yes' in opt.lower():
+                    return opt
+        return answer
+
     # Handle salary questions smartly
     salary_keywords = ['salary', 'compensation', 'pay', 'wage', 'expected salary', 'desired salary']
-    if any(keyword in question.lower() for keyword in salary_keywords):
+    if any(keyword in q_lower for keyword in salary_keywords):
         if job_title and location:
             salary = get_smart_salary(job_title, location)
             print(f"Smart salary for {job_title} in {location}: ${salary}")
@@ -113,10 +134,11 @@ Rules:
 2. Keep answer SHORT - one word or one sentence max
 3. If it's a Yes/No question → answer Yes or No only
 4. If options are provided → pick the BEST matching option exactly as written
-5. For work authorization → always Yes, no sponsorship needed
-6. For location questions about specific cities he's not in → answer No but willing to relocate
-7. For technology experience → use his years from profile
-8. Never make up experience he doesn't have
+5. Work authorization → ALWAYS "Yes" — he is authorized to work in the US
+6. Visa sponsorship → ALWAYS "No" — he does NOT require sponsorship (I-485 Pending = work authorized, no sponsorship needed)
+7. For location questions about specific cities he's not in → answer No but willing to relocate
+8. For technology experience → use his years from profile
+9. Never make up experience he doesn't have
 
 Return ONLY the answer, nothing else. No explanation.
 """
