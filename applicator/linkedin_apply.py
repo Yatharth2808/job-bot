@@ -314,11 +314,11 @@ def _click_best_option(options, answer):
 
 def handle_form_questions(page, job_title, location):
     """Fill every visible form element on the current Easy Apply step using AI."""
-    # Catch both the classic class and LinkedIn's newer component class names
+    # [data-test-form-element] is only on the outermost wrapper, so it avoids
+    # the nested-duplicate problem caused by partial class matching.
     question_items = page.query_selector_all(
         '.jobs-easy-apply-form-element, '
-        '[class*="fb-dash-form-element"], '
-        '[class*="text-entity-list-form-component"]'
+        '[data-test-form-element]'
     )
 
     for item in question_items:
@@ -346,6 +346,67 @@ def handle_form_questions(page, job_title, location):
 
             print(f"    Q: {question[:80]}")
 
+            # --- known-field fast-path (no AI call needed) ---
+            # Fill standard contact fields directly from the profile to avoid
+            # burning Groq rate-limit tokens on fields that never need AI.
+            q_lower = question.lower()
+            _full_name = os.getenv("FULL_NAME", "")
+            _name_parts = _full_name.split()
+            _profile_map = {
+                'first name':    _name_parts[0] if _name_parts else '',
+                'last name':     _name_parts[-1] if len(_name_parts) > 1 else '',
+                'email':         os.getenv("EMAIL", ""),
+                'phone':         os.getenv("PHONE", ""),
+                'mobile':        os.getenv("PHONE", ""),
+            }
+            for keyword, value in _profile_map.items():
+                if keyword in q_lower and value:
+                    inp = item.query_selector('input, textarea')
+                    if inp:
+                        try:
+                            if not inp.input_value():
+                                inp.fill(value)
+                                print(f"    A (profile): {value[:60]}")
+                                time.sleep(0.2)
+                        except Exception:
+                            pass
+                    break  # handled
+
+            # Location / city — combobox typeahead: type city then pick first suggestion
+            if any(k in q_lower for k in ('city', 'location', 'address')):
+                city_val = os.getenv("CURRENT_CITY", "") + ", " + os.getenv("CURRENT_STATE", "")
+                cb = item.query_selector('[role="combobox"], input[aria-autocomplete]')
+                if cb:
+                    try:
+                        current = cb.input_value()
+                        if not current:
+                            cb.click()
+                            time.sleep(0.3)
+                            cb.fill('')
+                            cb.type(os.getenv("CURRENT_CITY", "El Paso"), delay=80)
+                            time.sleep(1.5)
+                            try:
+                                page.wait_for_selector('[role="option"]', timeout=4000)
+                                options = page.query_selector_all('[role="option"]')
+                                if options:
+                                    options[0].click()
+                                    print(f"    A (location combobox): {city_val}")
+                                    time.sleep(0.5)
+                            except PlaywrightTimeoutError:
+                                cb.fill(city_val)
+                                print(f"    A (location fill): {city_val}")
+                    except Exception as e:
+                        print(f"    location fill error: {e}")
+                else:
+                    inp = item.query_selector('input')
+                    if inp:
+                        try:
+                            if not inp.input_value():
+                                inp.fill(city_val)
+                                print(f"    A (location fill): {city_val}")
+                        except Exception:
+                            pass
+
             # --- text / number / textarea ---
             text_input = item.query_selector(
                 'input[type="text"], input[type="number"], textarea'
@@ -368,6 +429,19 @@ def handle_form_questions(page, job_title, location):
             # --- select dropdown ---
             select = item.query_selector('select')
             if select:
+                # If already has a non-placeholder value, leave it alone
+                cur_val = select.input_value()
+                cur_label = ''
+                try:
+                    cur_label = select.evaluate(
+                        "el => el.options[el.selectedIndex]?.text || ''"
+                    ).strip().lower()
+                except Exception:
+                    pass
+                if cur_val and cur_label not in ('', 'select an option', 'please select'):
+                    print(f"    A (select already set): {cur_label[:60]}")
+                    continue
+
                 options = []
                 for opt in select.query_selector_all('option'):
                     text = opt.inner_text().strip()
